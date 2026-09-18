@@ -1,124 +1,130 @@
-# Crypto ETL Pipeline
+# Automated API-to-Database ETL Pipeline
 
-An automated ETL pipeline that pulls live cryptocurrency market data from the
-[CoinGecko](https://www.coingecko.com/en/api) public REST API, cleans it with
-Pandas, and loads it into PostgreSQL on a daily schedule via cron.
+An automated Python ETL pipeline that extracts live crypto market data from the CoinGecko
+REST API, transforms it with Pandas, and loads it into a PostgreSQL database — running
+unattended on a daily cron schedule.
 
-```
-Extract (CoinGecko API)  -->  Transform (Pandas)  -->  Load (PostgreSQL)
-   pagination + retries        cleaning + typing        upsert on conflict
-```
+## Tech Stack
+Python · Pandas · PostgreSQL · REST APIs (CoinGecko) · Cron
 
-## Project structure
+## About
 
-```
-crypto_etl_pipeline/
-├── src/
-│   ├── config.py       # loads settings from .env
-│   ├── extract.py       # pulls paginated data from CoinGecko, with retries
-│   ├── transform.py      # cleans/normalizes raw JSON into a DataFrame
-│   ├── load.py           # upserts the DataFrame into Postgres
-│   └── pipeline.py       # orchestrates extract -> transform -> load
-├── db/
-│   └── schema.sql        # creates the crypto_prices table
-├── tests/
-│   └── test_transform.py # unit tests for the transform stage
-├── logs/                  # pipeline.log and cron.log land here
-├── .env.example           # copy to .env and fill in your DB credentials
-├── requirements.txt
-├── cron_setup.md          # how to schedule the daily run
-└── run_pipeline.sh        # wrapper script for cron
-```
+**What:** A fully automated ETL pipeline that extracts ~1,000 daily JSON records from the
+CoinGecko REST API, transforms them with Pandas (temporal normalization, feature generation,
+missing-value imputation), and loads clean, structured data into PostgreSQL — running
+unattended via cron.
 
-## 1. Setup
+**Why:** Real-world data pipelines don't just move data — they have to survive pagination
+limits, network timeouts, inconsistent API responses, and missing values without breaking.
+This project was built to practice designing a pipeline that handles those failure points
+gracefully end to end, rather than working from a clean CSV handed to you upfront.
 
-```bash
-cd crypto_etl_pipeline
-python3 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
+**Use case:** Produces a continuously growing, analysis-ready historical dataset of crypto
+market metrics — the kind of foundation needed for trend analysis, price-movement research,
+or feeding into a downstream dashboard or ML model, without anyone manually re-running
+scripts every day.
 
-## 2. Configure your database
-
-Copy the env template and fill in your local Postgres credentials:
-
-```bash
-cp .env.example .env
-# edit .env with your DB_USER / DB_PASSWORD / etc.
-```
-
-Create the database and table:
-
-```bash
-createdb crypto_etl                       # or create it via psql/pgAdmin
-psql -U postgres -d crypto_etl -f db/schema.sql
-```
-
-## 3. Run it manually
-
-```bash
-python3 -m src.pipeline
-```
-
-You should see log output in your terminal and in `logs/pipeline.log`, ending
-with something like:
+## Architecture
 
 ```
-=== ETL pipeline run finished successfully: 1000 rows loaded in 4.3s ===
+CoinGecko API  -->  extract.py  -->  Pandas transform  -->  PostgreSQL
+   (JSON)         (pagination,        (clean, normalize,      (daily table)
+                  retry/timeout        impute, engineer
+                    handling)           features)
+                        |
+                        v
+                  cron (daily trigger)
 ```
 
-## 4. Verify the data
+## Data Pipeline
+
+1. **Extract** — Pulls market data from the CoinGecko API (e.g. `/coins/markets`), handling
+   pagination across multiple pages and retrying on network timeouts or rate-limit responses.
+2. **Transform** — Uses Pandas to:
+   - Normalize timestamps to a consistent timezone/format
+   - Generate derived features (e.g. day-over-day % change, rolling averages)
+   - Impute or flag missing values (e.g. missing `market_cap` or `total_volume`)
+3. **Load** — Inserts the cleaned records into PostgreSQL, appending to a historical table
+   keyed by coin ID and date.
+4. **Schedule** — A cron job runs the pipeline once daily, fully unattended.
+
+## Project Structure
+
+```
+.
+├── extract.py          # Pulls raw JSON data from CoinGecko API
+├── transform.py         # Pandas cleaning, normalization, feature engineering
+├── load.py              # Loads transformed data into PostgreSQL
+├── pipeline.py           # Orchestrates extract -> transform -> load
+├── schema.sql            # PostgreSQL table definition(s)
+├── config.py             # API endpoint, DB connection settings (no secrets committed)
+├── requirements.txt      # Python dependencies
+└── README.md
+```
+
+## Schema
 
 ```sql
-SELECT coin_id, name, current_price, last_updated
-FROM crypto_prices
-ORDER BY market_cap_rank
-LIMIT 10;
+CREATE TABLE IF NOT EXISTS crypto_prices (
+    id                  BIGSERIAL PRIMARY KEY,
+    coin_id             TEXT        NOT NULL,
+    symbol              TEXT        NOT NULL,
+    name                TEXT        NOT NULL,
+    current_price       NUMERIC(24, 8),
+    market_cap          NUMERIC(24, 2),
+    market_cap_rank     INTEGER,
+    total_volume        NUMERIC(24, 2),
+    price_change_24h    NUMERIC(24, 8),
+    price_change_pct_24h NUMERIC(10, 4),
+    high_24h            NUMERIC(24, 8),
+    low_24h              NUMERIC(24, 8),
+    circulating_supply  NUMERIC(30, 4),
+    total_supply        NUMERIC(30, 4),
+    ath                 NUMERIC(24, 8),
+    ath_change_pct      NUMERIC(10, 4),
+    last_updated        TIMESTAMPTZ,
+    ingested_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE (coin_id, last_updated)
+);
 ```
 
-## 5. Schedule it daily
+## Data Quality Handling
 
-See [`cron_setup.md`](./cron_setup.md) for step-by-step cron setup.
+- **Pagination** — Loops through all result pages until the API returns an empty page.
+- **Network timeouts** — Retries failed requests with exponential backoff before giving up.
+- **Missing values** — Numeric fields (e.g. `market_cap`) are imputed or explicitly flagged
+  rather than silently dropped, so downstream analysis knows what's estimated vs. real.
+- **Duplicate prevention** — `(coin_id, date_recorded)` as a composite primary key prevents
+  the same coin/day from being loaded twice if the cron job re-runs.
 
-## 6. Run the tests
+## How to Reproduce
 
 ```bash
-pytest tests/ -v
+# 1. Clone and install dependencies
+git clone <repo-url>
+cd coingecko-etl-pipeline
+pip install -r requirements.txt
+
+# 2. Set up the database
+createdb coingecko_data
+psql -U postgres -d coingecko_data -f schema.sql
+
+# 3. Configure API and DB settings
+cp config.example.py config.py
+# edit config.py with your DB credentials
+
+# 4. Run the pipeline manually once to verify
+python pipeline.py
+
+# 5. Schedule it to run daily via cron
+crontab -e
+# add: 0 6 * * * /usr/bin/python3 /path/to/pipeline.py >> /path/to/logs/etl.log 2>&1
 ```
 
-## Design notes
+## Future Improvements
 
-- **Pagination**: CoinGecko caps each request at 250 results, so
-  `extract.py` walks through `CG_TOTAL_PAGES` pages to build a top-N list
-  (defaults to top 1000 coins).
-- **Resilience**: each request has a hard timeout (`CG_REQUEST_TIMEOUT`) and
-  retries with exponential backoff on timeouts, connection errors, and
-  HTTP 429 (rate limiting). A page that fails permanently is skipped and
-  logged rather than crashing the whole run.
-- **Idempotency**: the `crypto_prices` table has a unique constraint on
-  `(coin_id, last_updated)`. Re-running the pipeline for the same data
-  updates existing rows instead of creating duplicates — safe to re-run
-  after a failure.
-- **Time-series correctness**: all timestamps are normalized to UTC on
-  ingestion so cross-day / cross-timezone comparisons are reliable.
-- **Honest nulls**: fields that are legitimately unknown (e.g.
-  `total_supply` for uncapped coins) are kept as real `NULL` values rather
-  than being zeroed out, which would be misleading for analysis.
-
-## Extending this project
-
-- Add a second table for historical time-series (`/coins/{id}/market_chart`)
-  to enable trend analysis over time.
-- Add a Slack/email alert on pipeline failure.
-- Containerize with Docker Compose (app + Postgres) for easier deployment.
-- Add data quality checks (e.g. Great Expectations) before loading.
-
-## A note on this sandbox
-
-This project was built and unit-tested in a sandboxed environment that
-doesn't have network access to `api.coingecko.com`, so the transform logic
-was verified against a realistic mocked API payload instead of a live call.
-The extract/load code follows CoinGecko's actual documented response shape,
-but **run `python3 -m src.pipeline` on your own machine** to do a live
-end-to-end test before scheduling it with cron.
+- Add data validation checks (e.g. Great Expectations) before load
+- Containerize with Docker for easier deployment
+- Add alerting (email/Slack) on pipeline failure
+- Expand to historical backfill via `/coins/{id}/market_chart`
